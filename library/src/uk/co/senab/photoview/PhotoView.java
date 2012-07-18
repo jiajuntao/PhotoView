@@ -10,6 +10,9 @@ import android.util.AttributeSet;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.Interpolator;
+import android.view.animation.OvershootInterpolator;
 import android.widget.ImageView;
 
 public class PhotoView extends ImageView implements VersionedGestureDetector.OnGestureListener,
@@ -48,7 +51,69 @@ public class PhotoView extends ImageView implements VersionedGestureDetector.OnG
 		void onPhotoTap(View view, float x, float y);
 	}
 
-	private class AnimatedZoomRunnable implements Runnable {
+	final class SmoothScrollRunnable implements Runnable {
+
+		static final int ANIMATION_DURATION_MS = 300;
+		static final int ANIMATION_DELAY = 10;
+
+		private final Interpolator mInterpolator;
+		private final int mTargetDeltaX, mTargetDeltaY;
+
+		private boolean mContinueRunning = true;
+		private long mStartTime = -1;
+		private int mCurrentX, mCurrentY = -1;
+
+		public SmoothScrollRunnable(int deltaX, int deltaY) {
+			mTargetDeltaX = deltaX;
+			mTargetDeltaY = deltaY;
+			mInterpolator = new DecelerateInterpolator();
+		}
+
+		@Override
+		public void run() {
+
+			/**
+			 * Only set mStartTime if this is the first time we're starting,
+			 * else actually calculate the Y delta
+			 */
+			if (mStartTime == -1) {
+				mStartTime = System.currentTimeMillis();
+			} else {
+
+				/**
+				 * We do do all calculations in long to reduce software float
+				 * calculations. We use 1000 as it gives us good accuracy and
+				 * small rounding errors
+				 */
+				long normalizedTime = (1000 * (System.currentTimeMillis() - mStartTime)) / ANIMATION_DURATION_MS;
+				normalizedTime = Math.max(Math.min(normalizedTime, 1000), 0);
+
+				final int deltaX = Math.round(mTargetDeltaX * mInterpolator.getInterpolation(normalizedTime / 1000f));
+				final int deltaY = Math.round(mTargetDeltaY * mInterpolator.getInterpolation(normalizedTime / 1000f));
+
+				onDrag(deltaX - mCurrentX, deltaY - mCurrentY);
+
+				mCurrentX = deltaX;
+				mCurrentY = deltaY;
+			}
+
+			// If we're not at the target X or Y, keep going...
+			if (mContinueRunning && (mCurrentX != mTargetDeltaX || mCurrentY != mTargetDeltaY)) {
+				if (VERSION.SDK_INT >= VERSION_CODES.JELLY_BEAN) {
+					SDK16.postOnAnimation(PhotoView.this, this);
+				} else {
+					postDelayed(this, ANIMATION_DELAY);
+				}
+			}
+		}
+
+		public void stop() {
+			mContinueRunning = false;
+			removeCallbacks(this);
+		}
+	}
+
+	class AnimatedZoomRunnable implements Runnable {
 
 		static final long ANIMATION_DURATION = 120;
 
@@ -108,6 +173,7 @@ public class PhotoView extends ImageView implements VersionedGestureDetector.OnG
 
 	private int mScrollEdge = EDGE_BOTH;
 	private boolean mZoomEnabled = false;
+	private boolean mIsBeingDragged = false;
 
 	public PhotoView(Context context) {
 		super(context);
@@ -175,11 +241,13 @@ public class PhotoView extends ImageView implements VersionedGestureDetector.OnG
 	}
 
 	public void onDrag(float dx, float dy) {
+		mIsBeingDragged = true;
 		mSuppMatrix.postTranslate(dx, dy);
-		centerAndDisplayMatrix();
+		setImageMatrix(getDisplayMatrix());
 	}
 
 	public void onScale(float scaleFactor, float focusX, float focusY) {
+		mIsBeingDragged = false;
 		if (getScale() < MAX_ZOOM || scaleFactor < 1f) {
 			mSuppMatrix.postScale(scaleFactor, scaleFactor, focusX, focusY);
 			centerAndDisplayMatrix();
@@ -231,10 +299,14 @@ public class PhotoView extends ImageView implements VersionedGestureDetector.OnG
 					case MotionEvent.ACTION_CANCEL:
 					case MotionEvent.ACTION_UP:
 						// If the user has zoomed less than MIN_ZOOM, zoom back
-						// to
-						// 1.0f
+						// to 1.0f
 						if (getScale() < MIN_ZOOM) {
 							post(new AnimatedZoomRunnable(MIN_ZOOM, 0f, 0f));
+						}
+
+						if (mIsBeingDragged) {
+							mIsBeingDragged = false;
+							checkMatrixBounds(true);
 						}
 						break;
 				}
@@ -325,8 +397,12 @@ public class PhotoView extends ImageView implements VersionedGestureDetector.OnG
 		checkMatrixBounds();
 		setImageMatrix(getDisplayMatrix());
 	}
-
+	
 	private void checkMatrixBounds() {
+		checkMatrixBounds(false);
+	}
+
+	private void checkMatrixBounds(boolean animate) {
 		Drawable d = getDrawable();
 		if (null == d) {
 			return;
@@ -361,7 +437,11 @@ public class PhotoView extends ImageView implements VersionedGestureDetector.OnG
 			mScrollEdge = EDGE_NONE;
 		}
 
-		mSuppMatrix.postTranslate(deltaX, deltaY);
+		if (animate) {
+			post(new SmoothScrollRunnable((int) deltaX, (int) deltaY));
+		} else {
+			mSuppMatrix.postTranslate(deltaX, deltaY);
+		}
 	}
 
 	/**
